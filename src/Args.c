@@ -2,6 +2,7 @@
 #include <string.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+
 #include "Args.h"
 #include "Errors.h"
 
@@ -63,52 +64,44 @@ static BOOL parse_int(LPCWSTR const str, int* result)
 
 static arg_parse_result_t parse_server_address_opt(program_arguments_t* program_arguments, LPCWSTR const opt_name, LPCWSTR const value)
 {
-    void *buf = malloc(sizeof(IN_ADDR));
-
-    switch (InetPtonW(AF_INET, value, buf)) {
+    switch (InetPtonW(AF_INET, value, &program_arguments->server_address.addr4)) {
         case 0: /* Value is not a valid IPv4 address, try IPv6 */
             break;
 
         case 1: /* Value parsed successfully */
-            program_arguments->server_address.in_addr = (IN_ADDR*)buf;
-            program_arguments->server_address_is_in6 = 0;
+			SET_AF_INET(program_arguments->server_address);
             return ARG_PARSE_SUCCESS;
 
         default: /* Something else went wrong, there's an error in our logic somewhere */
             error_push(L"Error parsing server address");
-            free(buf);
             return ARG_PARSE_ERROR;
     }
 
-    free(buf);
-    buf = malloc(sizeof(IN6_ADDR));
-
-    switch (InetPtonW(AF_INET6, value, buf)) {
+    switch (InetPtonW(AF_INET6, value, &program_arguments->server_address.addr6)) {
         case 0: /* Value is not a valid IPv6 address either */
             error_push(L"Invalid server address");
-            free(buf);
             return ARG_PARSE_ERROR;
 
         case 1: /* Value parsed successfully */
-            program_arguments->server_address.in6_addr = (IN6_ADDR*)buf;
-            program_arguments->server_address_is_in6 = 1;
+			SET_AF_INET6(program_arguments->server_address);
             return ARG_PARSE_SUCCESS;
 
         default: /* Something else went wrong, there's an error in our logic somewhere */
             error_push(L"Error parsing server address");
-            free(buf);
             return ARG_PARSE_ERROR;
     }
 }
 
 static arg_parse_result_t parse_server_port_opt(program_arguments_t* program_arguments, LPCWSTR const opt_name, LPCWSTR const value)
 {
-    if (parse_int(value, &program_arguments->server_port)
-        && program_arguments->server_port > 0 && program_arguments->server_port < 65536) {
+	int port;
+
+    if (parse_int(value, &port) && port > 0 && port < 65536) {
+		program_arguments->server_address.port = port;
         return ARG_PARSE_SUCCESS;
     }
 
-    error_push(L"Invalid server port: %d", program_arguments->server_port);
+    error_push(L"Invalid server port: %s", value);
     return ARG_PARSE_ERROR;
 }
 
@@ -187,15 +180,6 @@ static arg_parse_result_t parse_opt(program_arguments_t* program_arguments, LPCW
     return handler->parse_value(program_arguments, *opt_name, value);
 }
 
-static void init_program_arguments(program_arguments_t* program_arguments)
-{
-    program_arguments->server_port = 0;
-    memset(&program_arguments->server_address, 0, sizeof(in_addr_t));
-    program_arguments->server_address_is_in6 = -1;
-    program_arguments->token_size = 0;
-    program_arguments->exe_cwd = NULL;
-}
-
 static BOOL validate_program_arguments(program_arguments_t* program_arguments)
 {
     if (program_arguments->token_size == 0) {
@@ -203,7 +187,7 @@ static BOOL validate_program_arguments(program_arguments_t* program_arguments)
         return FALSE;
     }
 
-    if (program_arguments->server_port == 0) {
+    if (program_arguments->server_address.port == 0) {
         error_push(L"Server port not supplied");
         return FALSE;
     }
@@ -215,8 +199,6 @@ BOOL parse_opts(program_arguments_t* program_arguments, const int argc, LPCWSTR*
 {
     BOOL arg_value_only = FALSE;
     LPCWSTR opt_name = NULL;
-
-    init_program_arguments(program_arguments);
 
     for (int i = 1; i < argc; i++) {
         switch (parse_opt(program_arguments, argv[i], &opt_name, arg_value_only)) {
@@ -238,8 +220,9 @@ BOOL parse_opts(program_arguments_t* program_arguments, const int argc, LPCWSTR*
     }
 
 end_parse_opts:
-    if (program_arguments->server_address_is_in6 == -1) {
-        parse_server_address_opt(program_arguments, L"address", L"127.0.0.1");
+    if (program_arguments->server_address.family == 0) {
+		SET_AF_INET(program_arguments->server_address);
+		SET_IN_ADDR(program_arguments->server_address, 127, 0, 0, 1);
     }
 
     return validate_program_arguments(program_arguments);

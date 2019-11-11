@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <WS2tcpip.h>
+
 #include "Errors.h"
 #include "Args.h"
 #include "Encoding.h"
@@ -7,9 +8,11 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #define SOCKET_COUNT 3
+#define PIPE_COUNT 3
+
 #define BUFFER_SIZE 1024
 
-#define TOKEN_SIZE globals.arguments.token_size
+#define TOKEN_SIZE (globals.arguments.token_size)
 #define SERVER_TOKEN(id) (globals.server_tokens.buf + ((id) * TOKEN_SIZE))
 #define CLIENT_TOKEN(id) (globals.client_tokens.buf + ((id) * TOKEN_SIZE))
 
@@ -20,14 +23,6 @@ typedef enum _socket_state {
     SOCKET_STATE_ERROR,
 } socket_state_t;
 
-typedef struct _socket_info {
-    int id;
-    SOCKET socket;
-    socket_state_t state;
-} socket_info_t;
-
-#define HANDSHAKE_STATUS_OPTION_COUNT 7
-
 enum handshake_status {
     HANDSHAKE_STATUS_SUCCESS,
     HANDSHAKE_STATUS_SIGNAL_UNEXPECTED,
@@ -36,6 +31,7 @@ enum handshake_status {
     HANDSHAKE_STATUS_DUPLICATE_STREAM_ID,
     HANDSHAKE_STATUS_INVALID_CLIENT_TOKEN,
     HANDSHAKE_STATUS_INVALID_SERVER_TOKEN,
+	HANDSHAKE_STATUS_OPTION_COUNT,
 };
 
 LPCWSTR handshake_status_messages[HANDSHAKE_STATUS_OPTION_COUNT] = {
@@ -82,6 +78,11 @@ static struct {
 
 WSADATA wsa_data;
 
+struct {
+	SOCKET socket;
+	socket_state_t state;
+} sockets[SOCKET_COUNT];
+
 /*
  * Encode a DWORD to a char buffer in network byte order
  */
@@ -93,48 +94,29 @@ static void dword_to_buffer(const DWORD value, char* buffer)
     buffer[3] = value & 0xFF;
 }
 
-static BOOL socket_connect(socket_info_t* socket_info)
+static BOOL socket_connect(const int id)
 {
-    SOCKADDR* sockaddr;
-    int namelen;
     u_long non_blocking = 1;
 
-    int result = ioctlsocket(socket_info->socket, FIONBIO, &non_blocking);
+    int result = ioctlsocket(sockets[id].socket, FIONBIO, &non_blocking);
 
     if (result != NO_ERROR) {
-        error_push(L"Failed to set socket #%d to non-blocking mode, failed with %d", socket_info->id, result);
+        error_push(L"Failed to set socket #%d to non-blocking mode, failed with %d", id, result);
         return FALSE;
     }
 
-    if (globals.arguments.server_address_is_in6) {
-        struct sockaddr_in6 addr;
-        namelen = sizeof(addr);
-        addr.sin6_family = AF_INET6;
-        addr.sin6_addr = *globals.arguments.server_address.in6_addr;
-        addr.sin6_flowinfo = 0; /* I have no idea what this is for, but it doesn't seem to matter */
-        addr.sin6_port = htons(globals.arguments.server_port);
-        sockaddr = (SOCKADDR*)&addr;
-    } else {
-        struct sockaddr_in addr;
-        namelen = sizeof(addr);
-        addr.sin_family = AF_INET;
-        addr.sin_addr = *globals.arguments.server_address.in_addr;
-        addr.sin_port = htons(globals.arguments.server_port);
-        sockaddr = (SOCKADDR*)&addr;
-    }
-
-    result = WSAConnect(socket_info->socket, sockaddr, namelen, NULL, NULL, NULL, NULL);
+    result = WSAConnect(sockets[id].socket, &globals.arguments.server_address.sockaddr, globals.arguments.server_address.length, NULL, NULL, NULL, NULL);
 
     /* Should fail with WSAEWOULDBLOCK */
     if (result != SOCKET_ERROR) {
-        error_push(L"Connecting socket #%d unexpectedly succeeded", socket_info->id);
+        error_push(L"Connecting socket #%d unexpectedly succeeded", id);
         return FALSE;
     }
 
     const int error = WSAGetLastError();
 
     if (error != WSAEWOULDBLOCK) {
-        system_error_push(error, L"Connecting socket #%d failed", socket_info->id);
+        system_error_push(error, L"Connecting socket #%d failed", id);
         return FALSE;
     }
 
@@ -148,13 +130,13 @@ static BOOL socket_connect(socket_info_t* socket_info)
  * a safe assumption, since the sockets are in blocking mode while passing through child process data, and all other data exchange is done in very
  * small chunks.
  */
-static BOOL socket_send(const SOCKET socket, const int id, WSABUF *buffers, const DWORD buffer_count, LPCWSTR const description)
+static BOOL socket_send(const int id, WSABUF *buffers, const DWORD buffer_count, LPCWSTR const description)
 {
     ULONG length = 0;
     DWORD bytes_written;
 
     /* Assume that the socket is writable without blocking, at this point the internal buffer must be empty */
-    const int result = WSASend(socket, buffers, buffer_count, &bytes_written, 0, NULL, NULL);
+    const int result = WSASend(sockets[id].socket, buffers, buffer_count, &bytes_written, 0, NULL, NULL);
 
     if (result == SOCKET_ERROR) {
         system_error_push(WSAGetLastError(), L"Failed to send %s to socket #%d", description, id);
@@ -176,34 +158,32 @@ static BOOL socket_send(const SOCKET socket, const int id, WSABUF *buffers, cons
 /*
  * Process writability on a socket which is connecting
  */
-static BOOL socket_process_connect_writable(socket_info_t* socket_info)
+static BOOL socket_process_connect_writable(const int id)
 {
     u_long non_blocking = 0;
 
-    const int result = ioctlsocket(socket_info->socket, FIONBIO, &non_blocking);
+    const int result = ioctlsocket(sockets[id].socket, FIONBIO, &non_blocking);
 
     if (result != NO_ERROR) {
-        error_push(L"Failed to set socket #%d to blocking mode, failed with %d", socket_info->id, result);
+        error_push(L"Failed to set socket #%d to blocking mode, failed with %d", id, result);
         return FALSE;
     }
 
     char socket_id[6];
-    const WSABUF socket_id_buffer = { .len = 6,.buf = socket_id };
-    const WSABUF token_buffer = { .len = TOKEN_SIZE, .buf = CLIENT_TOKEN(socket_info->id) };
-    WSABUF buffers[2];
+	socket_id[0] = SIGNAL_CODE_HANDSHAKE;
+	dword_to_buffer(GetCurrentProcessId(), socket_id + 1);
+	socket_id[5] = id;
 
-    socket_id[0] = SIGNAL_CODE_HANDSHAKE;
-    dword_to_buffer(GetCurrentProcessId(), socket_id + 1);
-    socket_id[5] = socket_info->id;
+	WSABUF buffers[] = {
+		{.len = 6,.buf = socket_id},
+		{.len = TOKEN_SIZE,.buf = CLIENT_TOKEN(id)},
+	};
 
-    buffers[0] = socket_id_buffer;
-    buffers[1] = token_buffer;
-
-    if (!socket_send(socket_info->socket, socket_info->id, buffers, 2, L"handshake")) {
+    if (!socket_send(id, buffers, 2, L"handshake")) {
         return FALSE;
     }
 
-    socket_info->state = SOCKET_STATE_WAIT_ACK;
+	sockets[id].state = SOCKET_STATE_WAIT_ACK;
 
     return TRUE;
 }
@@ -211,7 +191,7 @@ static BOOL socket_process_connect_writable(socket_info_t* socket_info)
 /*
  * Process readability on a socket which is connecting
  */
-static BOOL socket_process_connect_readable(socket_info_t* socket_info)
+static BOOL socket_process_connect_readable(const int id)
 {
     WSABUF buffer;
     DWORD bytes_read, flags = 0;
@@ -219,22 +199,22 @@ static BOOL socket_process_connect_readable(socket_info_t* socket_info)
     buffer.len = TOKEN_SIZE + 2;
     buffer.buf = malloc(buffer.len);
 
-    const int result = WSARecv(socket_info->socket, &buffer, 1, &bytes_read, &flags, NULL, NULL);
+    const int result = WSARecv(sockets[id].socket, &buffer, 1, &bytes_read, &flags, NULL, NULL);
 
     if (result == SOCKET_ERROR) {
-        system_error_push(WSAGetLastError(), L"Failed to read handshake data from socket #%d", socket_info->id);
+        system_error_push(WSAGetLastError(), L"Failed to read handshake data from socket #%d", id);
         free(buffer.buf);
         return FALSE;
     }
 
     if (bytes_read < 2) {
-        error_push(L"Failed to read handshake data from socket #%d: received %d of expected %d bytes", socket_info->id, bytes_read, buffer.len);
+        error_push(L"Failed to read handshake data from socket #%d: received %d of expected %d bytes", id, bytes_read, buffer.len);
         free(buffer.buf);
         return FALSE;
     }
 
     if (buffer.buf[0] != SIGNAL_CODE_HANDSHAKE_ACK) {
-        error_push(L"Handshake failed for socket #%d: Unexpected signal code %d from server, expecting HANDSHAKE_ACK", socket_info->id, buffer.buf[0]);
+        error_push(L"Handshake failed for socket #%d: Unexpected signal code %d from server, expecting HANDSHAKE_ACK", id, buffer.buf[0]);
         free(buffer.buf);
         return FALSE;
     }
@@ -242,7 +222,7 @@ static BOOL socket_process_connect_readable(socket_info_t* socket_info)
     if (buffer.buf[1] != HANDSHAKE_STATUS_SUCCESS) {
         error_push(
             L"Handshake failed for socket #%d: Server rejected connection: %d: %s", 
-            socket_info->id, buffer.buf[1], 
+            id, buffer.buf[1], 
             buffer.buf[1] < HANDSHAKE_STATUS_OPTION_COUNT ? handshake_status_messages[(unsigned char)buffer.buf[1]] : L"Unknown error"
         );
         free(buffer.buf);
@@ -255,18 +235,18 @@ static BOOL socket_process_connect_readable(socket_info_t* socket_info)
     BOOL success = FALSE;
 
     if (bytes_read != buffer.len) {
-        error_push(L"Failed to read handshake data from socket #%d: received %d of expected %d bytes", socket_info->id, bytes_read, buffer.len);
-    } else if (memcmp(buffer.buf + 2, SERVER_TOKEN(socket_info->id), TOKEN_SIZE) != 0) {
-        error_push(L"Handshake failed for socket #%d: Invalid server token", socket_info->id);
+        error_push(L"Failed to read handshake data from socket #%d: received %d of expected %d bytes", id, bytes_read, buffer.len);
+    } else if (memcmp(buffer.buf + 2, SERVER_TOKEN(id), TOKEN_SIZE) != 0) {
+        error_push(L"Handshake failed for socket #%d: Invalid server token", id);
     } else {
         ack_message[1] = HANDSHAKE_STATUS_SUCCESS;
-        socket_info->state = SOCKET_STATE_CONNECTED;
+        sockets[id].state = SOCKET_STATE_CONNECTED;
         success = TRUE;
     }
 
     free(buffer.buf);
 
-    if (!socket_send(socket_info->socket, socket_info->id, &ack_buffer, 1, L"handshake ack")) {
+    if (!socket_send(id, &ack_buffer, 1, L"handshake ack")) {
         return FALSE;
     }
 
@@ -276,27 +256,27 @@ static BOOL socket_process_connect_readable(socket_info_t* socket_info)
 /*
  * Process error on a socket which is connecting
  */
-static void socket_process_connect_error(socket_info_t* socket_info)
+static void socket_process_connect_error(id)
 {
     int code;
     int len = sizeof(int);
 
-    const int result = getsockopt(socket_info->socket, SOL_SOCKET, SO_ERROR, (char*)&code, &len);
+    const int result = getsockopt(sockets[id].socket, SOL_SOCKET, SO_ERROR, (char*)&code, &len);
 
     if (result == SOCKET_ERROR) {
-        error_push(L"Failed to connect socket #%d: Unknown error", socket_info->id);
+        error_push(L"Failed to connect socket #%d: Unknown error", id);
     } else {
-        system_error_push(code, L"Failed to connect socket #%d", socket_info->id);
+        system_error_push(code, L"Failed to connect socket #%d", id);
     }
 }
 
 /*
  * Determines whether any sockets have pending connect actions
  */
-static BOOL socketset_have_pending_connect(socket_info_t **sockets)
+static BOOL socketset_have_pending_connect()
 {
     for (int i = 0; i < SOCKET_COUNT; i++) {
-        if (sockets[i]->state < SOCKET_STATE_CONNECTED) {
+        if (sockets[i].state < SOCKET_STATE_CONNECTED) {
             return TRUE;
         }
     }
@@ -307,24 +287,17 @@ static BOOL socketset_have_pending_connect(socket_info_t **sockets)
 /*
  * Initialize the sockets array
  */
-static BOOL socketset_create(socket_info_t** sockets, int count)
+static BOOL socketset_create()
 {
-    const int address_family = globals.arguments.server_address_is_in6 ? AF_INET6 : AF_INET;
-
-    for (int i = 0; i < count; i++) {
-        socket_info_t* socket_info = malloc(sizeof(socket_info_t));
-
-        socket_info->id = i;
-        socket_info->state = SOCKET_STATE_WAIT_CONNECT;
-        socket_info->socket = socket(address_family, SOCK_STREAM, IPPROTO_TCP);
-
-        if (socket_info->socket == INVALID_SOCKET) {
-            error_push(L"Failed to create socket #%d", socket_info->id);
+    for (int i = 0; i < SOCKET_COUNT; i++) {
+		sockets[i].socket = socket(globals.arguments.server_address.family, SOCK_STREAM, IPPROTO_TCP);
+		sockets[i].state = SOCKET_STATE_WAIT_CONNECT;
+		
+		if (sockets[i].socket == INVALID_SOCKET) {
+            error_push(L"Failed to create socket #%d", i);
             return FALSE;
         }
-
-        sockets[i] = socket_info;
-    }
+	}
 
     return TRUE;
 }
@@ -334,28 +307,27 @@ static BOOL socketset_create(socket_info_t** sockets, int count)
  */
 static DWORD WINAPI socketset_connect(LPVOID param)
 {
-    socket_info_t **sockets = (socket_info_t**)param;
     FD_SET read_set;
     FD_SET write_set;
     FD_SET error_set;
 
     for (int i = 0; i < SOCKET_COUNT; i++) {
-        if (!socket_connect(sockets[i])) {
+        if (!socket_connect(i)) {
             return FAILURE;
         }
     }
 
-    while (socketset_have_pending_connect(sockets)) {
+    while (socketset_have_pending_connect()) {
         FD_ZERO(&read_set);
         FD_ZERO(&write_set);
         FD_ZERO(&error_set);
 
         for (int i = 0; i < SOCKET_COUNT; i++) {
-            if (sockets[i]->state == SOCKET_STATE_WAIT_CONNECT) {
-                FD_SET(sockets[i]->socket, &write_set);
-                FD_SET(sockets[i]->socket, &error_set);
-            } else if (sockets[i]->state == SOCKET_STATE_WAIT_ACK) {
-                FD_SET(sockets[i]->socket, &read_set);
+            if (sockets[i].state == SOCKET_STATE_WAIT_CONNECT) {
+                FD_SET(sockets[i].socket, &write_set);
+                FD_SET(sockets[i].socket, &error_set);
+            } else if (sockets[i].state == SOCKET_STATE_WAIT_ACK) {
+                FD_SET(sockets[i].socket, &read_set);
             }
         }
 
@@ -372,20 +344,20 @@ static DWORD WINAPI socketset_connect(LPVOID param)
         }
 
         for (int i = 0; pending_activity_count > 0 && i < SOCKET_COUNT; i++) {
-            if (FD_ISSET(sockets[i]->socket, &read_set)) {
-                if (!socket_process_connect_readable(sockets[i])) {
+            if (FD_ISSET(sockets[i].socket, &read_set)) {
+                if (!socket_process_connect_readable(i)) {
                     return FAILURE;
                 }
 
                 pending_activity_count--;
-            } else if (FD_ISSET(sockets[i]->socket, &write_set)) {
-                if (!socket_process_connect_writable(sockets[i])) {
+            } else if (FD_ISSET(sockets[i].socket, &write_set)) {
+                if (!socket_process_connect_writable(i)) {
                     return FAILURE;
                 }
 
                 pending_activity_count--;
-            } else if (FD_ISSET(sockets[i]->socket, &error_set)) {
-                socket_process_connect_error(sockets[i]);
+            } else if (FD_ISSET(sockets[i].socket, &error_set)) {
+                socket_process_connect_error(i);
                 return FAILURE;
             }
         }
@@ -479,7 +451,7 @@ static DWORD WINAPI copy_output_to_socket(LPVOID param)
 
         buffer.len = bytes_read;
 
-        if (!socket_send(pair->socket, pair->id, &buffer, 1, L"data")) {
+        if (!socket_send(pair->id, &buffer, 1, L"data")) {
             goto failure;
         }
     }
@@ -608,14 +580,14 @@ BOOL get_tokens_from_stdin()
     return TRUE;
 }
 
-static BOOL send_dword_to_parent(socket_info_t *socket, const signal_code_t signal_code, const DWORD data, LPCWSTR const description)
+static BOOL send_dword_to_parent(const int id, const signal_code_t signal_code, const DWORD data, LPCWSTR const description)
 {
     char bytes[5] = { signal_code };
     WSABUF buffer = { .len = 5, .buf = bytes };
 
     dword_to_buffer(data, bytes + 1);
 
-    return socket_send(socket->socket, socket->id, &buffer, 1, description);
+    return socket_send(id, &buffer, 1, description);
 }
 
 static BOOL wait_for_threads(HANDLE *copy_threads)
@@ -663,7 +635,6 @@ static BOOL wait_for_threads(HANDLE *copy_threads)
 int wmain(const int argc, LPCWSTR* argv)
 {
     DWORD exit_code;
-    socket_info_t* sockets[SOCKET_COUNT];
 
     /* Initialize error handlers */
     errors_init();
@@ -688,16 +659,15 @@ int wmain(const int argc, LPCWSTR* argv)
     }
 
     /* Connect to server */
-    if (!socketset_create(sockets, SOCKET_COUNT)) {
+    if (!socketset_create()) {
         errors_output_all();
         return FAILURE;
     }
 
-    HANDLE connect_thread = CreateThread(NULL, 0, socketset_connect, &sockets, 0, NULL);
+    HANDLE connect_thread = CreateThread(NULL, 0, socketset_connect, NULL, 0, NULL);
 
     /* Initialize the data for the child process */
-    process_info_t process_info;
-    ZeroMemory(&process_info, sizeof(process_info_t));
+	process_info_t process_info = {0};
 
     if (!process_init(&process_info)) {
         errors_output_all();
@@ -730,7 +700,7 @@ int wmain(const int argc, LPCWSTR* argv)
 
     /* Send the process id to the parent on the stdin socket - despite the fact that another
     * thread might be doing stuff with this socket it is safe because it will only be reading */
-    if (!send_dword_to_parent(sockets[0], SIGNAL_CODE_CHILD_PID, process_info.process_info.dwProcessId, L"PID")) {
+    if (!send_dword_to_parent(0, SIGNAL_CODE_CHILD_PID, process_info.process_info.dwProcessId, L"PID")) {
         errors_output_all();
         return FAILURE;
     }
@@ -740,19 +710,19 @@ int wmain(const int argc, LPCWSTR* argv)
 
     file_socket_pair_t stdin_pair;
     stdin_pair.id = 0;
-    stdin_pair.socket = sockets[0]->socket;
+    stdin_pair.socket = sockets[0].socket;
     stdin_pair.file = process_info.pipes[0].write;
     copy_threads[0] = CreateThread(NULL, 0, copy_socket_to_input, &stdin_pair, 0, NULL);
 
     file_socket_pair_t stdout_pair;
     stdout_pair.id = 1;
-    stdout_pair.socket = sockets[1]->socket;
+    stdout_pair.socket = sockets[1].socket;
     stdout_pair.file = process_info.pipes[1].read;
     copy_threads[1] = CreateThread(NULL, 0, copy_output_to_socket, &stdout_pair, 0, NULL);
 
     file_socket_pair_t stderr_pair;
     stderr_pair.id = 2;
-    stderr_pair.socket = sockets[2]->socket;
+    stderr_pair.socket = sockets[2].socket;
     stderr_pair.file = process_info.pipes[2].read;
     copy_threads[2] = CreateThread(NULL, 0, copy_output_to_socket, &stderr_pair, 0, NULL);
 
@@ -771,7 +741,7 @@ int wmain(const int argc, LPCWSTR* argv)
     }
 
     /* Send the process exit code to the parent on the stdin socket */
-    if (!send_dword_to_parent(sockets[0], SIGNAL_CODE_EXIT_CODE, exit_code, L"exit code")) {
+    if (!send_dword_to_parent(0, SIGNAL_CODE_EXIT_CODE, exit_code, L"exit code")) {
         errors_output_all();
         return FAILURE;
     }
@@ -783,7 +753,7 @@ int wmain(const int argc, LPCWSTR* argv)
     }
 
     /* Don't close the stdin socket until all data has been sent *and* the copy thread as ended */
-    closesocket(sockets[0]->socket);
+    closesocket(sockets[0].socket);
 
     /* Exit with the same code as the child */
     return exit_code;
